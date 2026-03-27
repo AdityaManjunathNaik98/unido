@@ -11,7 +11,7 @@ import requests
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════
 
-LLM_API_URL   = "http://ollama-keda.mobiusdtaas.ai"
+LLM_API_URL   = "http://ollama.ollama-keda.svc.cluster.local:11434"
 MODEL_NAME    = "gpt-oss:20b"
 
 INPUT_FILE    = "metrics.json"
