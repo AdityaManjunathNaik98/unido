@@ -120,19 +120,8 @@ def pull_model(model: str, logger) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 def with_retry(fn, label: str, logger, model: str = None):
-    """
-    Call fn() up to MAX_RETRIES times.
-
-    On each failure:
-      • If the error looks like a missing-model error AND a model name was
-        supplied, attempt to pull the model once before the next retry.
-      • Otherwise wait RETRY_DELAY seconds and try again.
-
-    The pull is attempted at most once per with_retry call to avoid
-    hammering the registry on unrelated errors.
-    """
-    last_exc   = None
-    pulled     = False          # track whether we've already pulled once
+    last_exc = None
+    pulled   = False
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -144,16 +133,14 @@ def with_retry(fn, label: str, logger, model: str = None):
                 logger.error(f"[RETRY] {label} – all {MAX_RETRIES} attempts failed. Last error: {exc}")
                 break
 
-            # ── Decide how long to wait (or whether to pull first) ────
-            if model and not pulled and _is_model_missing_error(exc):
-                logger.warning(
-                    f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} "
-                    f"looks like a missing-model error: {exc}"
-                )
-                pulled = pull_model(model, logger)   # True = pulled OK
+            # Pull the model on the very first failure, once
+            if model and not pulled:
+                logger.warning(f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} failed: {exc}")
+                logger.info(f"[RETRY] First failure — pulling model before next attempt...")
+                pulled = pull_model(model, logger)
                 if not pulled:
                     logger.error("[RETRY] Model pull failed; continuing retries anyway.")
-                # No extra sleep — the pull itself takes time
+                # No sleep — pull itself takes time
             else:
                 logger.warning(
                     f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} failed: {exc}. "
