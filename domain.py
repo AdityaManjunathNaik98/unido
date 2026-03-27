@@ -11,8 +11,7 @@ import requests
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════
 
-LLM_API_URL   = "http://ollama.ollama-keda.svc.cluster.local:11434"
-# LLM_API_URL   = "http://ollama-keda.mobiusdtaas.ai"
+LLM_API_URL   = "http://ollama-keda.mobiusdtaas.ai"
 MODEL_NAME    = "gpt-oss:20b"
 
 INPUT_FILE    = "metrics.json"
@@ -78,21 +77,90 @@ def setup_logger():
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  RETRY HELPER
+#  MODEL MANAGEMENT  (pull on demand)
 # ══════════════════════════════════════════════════════════════════════
 
-def with_retry(fn, label, logger):
-    last_exc = None
+def _is_model_missing_error(exc: Exception) -> bool:
+    """
+    Return True when the exception looks like an Ollama 'model not found' error.
+    Covers HTTP 404 responses and plain-text error bodies that mention the model.
+    """
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("model", "not found", "404", "pull"))
+
+
+def pull_model(model: str, logger) -> bool:
+    """
+    POST /api/pull (non-streaming).  Returns True on success, False on failure.
+    Uses its own fixed retry loop so a slow download doesn't count against
+    the caller's MAX_RETRIES budget.
+    """
+    logger.info(f"[MODEL] Pulling '{model}' from Ollama — this may take a while...")
+    for attempt in range(1, 4):           # up to 3 pull attempts
+        try:
+            resp = requests.post(
+                f"{LLM_API_URL}/api/pull",
+                headers={"Content-Type": "application/json"},
+                json={"model": model, "stream": False},
+                timeout=600,              # large model downloads take time
+            )
+            resp.raise_for_status()
+            logger.info(f"[MODEL] Pull succeeded for '{model}'.")
+            return True
+        except Exception as exc:
+            logger.warning(f"[MODEL] Pull attempt {attempt}/3 failed: {exc}")
+            if attempt < 3:
+                time.sleep(5)
+    logger.error(f"[MODEL] All pull attempts failed for '{model}'.")
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  RETRY HELPER  (with on-demand model pull)
+# ══════════════════════════════════════════════════════════════════════
+
+def with_retry(fn, label: str, logger, model: str = None):
+    """
+    Call fn() up to MAX_RETRIES times.
+
+    On each failure:
+      • If the error looks like a missing-model error AND a model name was
+        supplied, attempt to pull the model once before the next retry.
+      • Otherwise wait RETRY_DELAY seconds and try again.
+
+    The pull is attempted at most once per with_retry call to avoid
+    hammering the registry on unrelated errors.
+    """
+    last_exc   = None
+    pulled     = False          # track whether we've already pulled once
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn()
         except Exception as exc:
             last_exc = exc
-            if attempt < MAX_RETRIES:
-                logger.warning(f"[RETRY] {label} attempt {attempt}/{MAX_RETRIES} failed: {exc}. Retrying in {RETRY_DELAY}s...")
-                time.sleep(RETRY_DELAY)
+
+            if attempt == MAX_RETRIES:
+                logger.error(f"[RETRY] {label} – all {MAX_RETRIES} attempts failed. Last error: {exc}")
+                break
+
+            # ── Decide how long to wait (or whether to pull first) ────
+            if model and not pulled and _is_model_missing_error(exc):
+                logger.warning(
+                    f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} "
+                    f"looks like a missing-model error: {exc}"
+                )
+                pulled = pull_model(model, logger)   # True = pulled OK
+                if not pulled:
+                    logger.error("[RETRY] Model pull failed; continuing retries anyway.")
+                # No extra sleep — the pull itself takes time
             else:
-                logger.error(f"[RETRY] {label} all {MAX_RETRIES} attempts failed.")
+                logger.warning(
+                    f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} failed: {exc}. "
+                    f"Retrying in {RETRY_DELAY}s..."
+                )
+                time.sleep(RETRY_DELAY)
+
     raise last_exc
 
 
@@ -131,10 +199,6 @@ def save_checkpoint(enriched, next_index, logger):
 # ══════════════════════════════════════════════════════════════════════
 
 def fetch_human_label(series_id: str, logger) -> str:
-    """
-    Turn a raw series code like 'mva_gdp_pct' into a readable label like
-    'Manufacturing Value Added (% of GDP)'.
-    """
     prompt = f"""You are an expert in economic and social indicators.
 
 Convert the following indicator code into a short, human-readable label (max 8 words).
@@ -164,7 +228,8 @@ JSON response:"""
         return json.loads(raw.strip()).get("label", series_id)
 
     try:
-        return with_retry(_call, label=f"human label for '{series_id}'", logger=logger)
+        return with_retry(_call, label=f"human label for '{series_id}'",
+                          logger=logger, model=MODEL_NAME)
     except Exception as exc:
         logger.error(f"[LABEL] Failed for '{series_id}': {exc}. Keeping original.")
         return series_id
@@ -175,13 +240,8 @@ JSON response:"""
 # ══════════════════════════════════════════════════════════════════════
 
 def fetch_domain_and_context(row: dict, logger) -> dict:
-    """
-    Given a metric row, ask the LLM for:
-      - domain  : ISIC Rev.4 letter (A–U)
-      - context : short plain-English description
-    """
     series = row.get("series", "N/A")
-    value  = row.get("value", series)   # use humanised label if available
+    value  = row.get("value", series)
 
     prompt = f"""You are a data analyst specialising in global economic and social indicators.
 
@@ -229,21 +289,18 @@ JSON response:"""
         return {"domain": domain, "context": context}
 
     try:
-        return with_retry(_call, label=f"domain/context for '{series}' economy={row.get('economy')}", logger=logger)
+        return with_retry(_call, label=f"domain/context for '{series}' economy={row.get('economy')}",
+                          logger=logger, model=MODEL_NAME)
     except Exception as exc:
         logger.error(f"[ENRICH] All retries exhausted: {exc}. Using fallback.")
         return {"domain": "S", "context": ""}
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  PRE-PASS – Humanise unique series labels (one LLM call per series)
+#  PRE-PASS – Humanise unique series labels
 # ══════════════════════════════════════════════════════════════════════
 
 def build_label_map(records: list, logger) -> dict:
-    """
-    Collect all unique series codes, call the LLM once per code,
-    and return a dict: { series_code -> human label }.
-    """
     unique_series = list({r["series"] for r in records if r.get("series")})
     logger.info(f"Pre-pass: humanising {len(unique_series)} unique series labels...")
 
@@ -266,14 +323,11 @@ def run(input_file: str, start_index: int, logger):
     total   = len(records)
     logger.info(f"Loaded {total} records from {input_file}")
 
-    # ── Pre-pass: resolve human labels for all unique series IDs ──────
     label_map = build_label_map(records, logger)
 
-    # Patch 'value' field in every record before enrichment
     for r in records:
         r["value"] = label_map.get(r.get("series", ""), r.get("value", r.get("series", "")))
 
-    # ── Load checkpoint ───────────────────────────────────────────────
     enriched, next_idx = load_checkpoint(logger)
     if start_index > 0:
         enriched = enriched[:start_index]
@@ -305,7 +359,6 @@ def run(input_file: str, start_index: int, logger):
             save_checkpoint(enriched, i + 1, logger)
             time.sleep(REQUEST_DELAY)
 
-    # ── Save final output ─────────────────────────────────────────────
     Path(OUTPUT_FILE).write_text(
         json.dumps(enriched, indent=2, ensure_ascii=False), encoding="utf-8"
     )
