@@ -11,17 +11,30 @@ import requests
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════
 
-LLM_API_URL   = "http://ollama.ollama-keda.svc.cluster.local:11434"
-MODEL_NAME    = "gpt-oss:20b"
+LLM_API_URL = "http://vllm-gpt-oss.mobiusdtaas.ai/v1/chat/completions"
+MODEL_NAME  = "openai/gpt-oss-20b"
 
-INPUT_FILE    = "metrics.json"
-OUTPUT_FILE   = "enriched.json"
-CHECKPOINT    = "enriched.checkpoint.json"
-LOG_FILE      = "enrichment.log"
+INPUT_FILE  = "metrics.json"
+OUTPUT_FILE = "enriched.json"
+CHECKPOINT  = "enriched.checkpoint.json"
+LOG_FILE    = "enrichment.log"
 
 REQUEST_DELAY = 0.3
 MAX_RETRIES   = 5
 RETRY_DELAY   = 3.0
+
+# ══════════════════════════════════════════════════════════════════════
+#  SYSTEM PROMPT  (shared across all LLM calls)
+# ══════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT = (
+    "You are an expert data analyst specialising in global economic and social "
+    "indicators, statistical metadata, and international classification standards "
+    "(including ISIC Rev.4). "
+    "When asked to produce JSON, return ONLY a valid JSON object — no markdown "
+    "fences, no preamble, no trailing commentary. "
+    "Keep all textual values concise and plain-English."
+)
 
 # ══════════════════════════════════════════════════════════════════════
 #  ISIC Rev.4 Sections
@@ -77,77 +90,97 @@ def setup_logger():
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  MODEL MANAGEMENT  (pull on demand)
+#  CORE vLLM HELPER
 # ══════════════════════════════════════════════════════════════════════
 
-def _is_model_missing_error(exc: Exception) -> bool:
+def call_vllm(user_prompt: str, temperature: float = 0.3, max_tokens: int = 512,
+              logger=None) -> str:
     """
-    Return True when the exception looks like an Ollama 'model not found' error.
-    Covers HTTP 404 responses and plain-text error bodies that mention the model.
-    """
-    msg = str(exc).lower()
-    return any(kw in msg for kw in ("model", "not found", "404", "pull"))
+    Send a chat-completion request to the vLLM endpoint.
+    Returns the raw text content of the assistant's reply.
 
+    The system prompt is fixed for every call; the caller supplies the
+    user-turn prompt.
+    """
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "temperature": temperature,
+        "max_tokens":  max_tokens,
+    }
 
-def pull_model(model: str, logger) -> bool:
-    """
-    POST /api/pull (non-streaming).  Returns True on success, False on failure.
-    Uses its own fixed retry loop so a slow download doesn't count against
-    the caller's MAX_RETRIES budget.
-    """
-    logger.info(f"[MODEL] Pulling '{model}' from Ollama — this may take a while...")
-    for attempt in range(1, 4):           # up to 3 pull attempts
-        try:
-            resp = requests.post(
-                f"{LLM_API_URL}/api/pull",
-                headers={"Content-Type": "application/json"},
-                json={"model": model, "stream": False},
-                timeout=600,              # large model downloads take time
-            )
-            resp.raise_for_status()
-            logger.info(f"[MODEL] Pull succeeded for '{model}'.")
-            return True
-        except Exception as exc:
-            logger.warning(f"[MODEL] Pull attempt {attempt}/3 failed: {exc}")
-            if attempt < 3:
-                time.sleep(5)
-    logger.error(f"[MODEL] All pull attempts failed for '{model}'.")
-    return False
+    resp = requests.post(
+        LLM_API_URL,
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=300,
+    )
+
+    # ── Log HTTP status code always ──────────────────────────────────
+    if logger:
+        logger.debug(f"[vLLM] HTTP {resp.status_code} from {LLM_API_URL}")
+
+    # ── On non-2xx, log body before raising ─────────────────────────
+    if not resp.ok:
+        if logger:
+            logger.error(f"[vLLM] Non-OK response ({resp.status_code}). Body: {resp.text[:1000]}")
+        resp.raise_for_status()
+
+    data = resp.json()
+
+    # ── Log full raw response at DEBUG level ─────────────────────────
+    if logger:
+        logger.debug(f"[vLLM] Raw response: {json.dumps(data, ensure_ascii=False)[:2000]}")
+
+    # ── Extract content safely ───────────────────────────────────────
+    try:
+        choice  = data["choices"][0]
+        message = choice["message"]
+        content = message.get("content")
+
+        if content is None:
+            # Some models return content=null when finish_reason is tool_calls
+            # or when the response is in reasoning_content only — log everything
+            if logger:
+                logger.error(
+                    f"[vLLM] content is None. finish_reason={choice.get('finish_reason')!r} "
+                    f"| stop_reason={choice.get('stop_reason')!r} "
+                    f"| message keys={list(message.keys())} "
+                    f"| usage={data.get('usage')}"
+                )
+            raise ValueError(f"vLLM returned content=None (finish_reason={choice.get('finish_reason')!r})")
+
+        return content.strip()
+
+    except (KeyError, IndexError) as exc:
+        if logger:
+            logger.error(f"[vLLM] Unexpected response shape: {data}")
+        raise ValueError(f"Unexpected vLLM response shape: {exc}") from exc
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  RETRY HELPER  (with on-demand model pull)
+#  RETRY HELPER
 # ══════════════════════════════════════════════════════════════════════
 
-def with_retry(fn, label: str, logger, model: str = None):
+def with_retry(fn, label: str, logger):
+    """Generic retry wrapper — no model-pull logic needed for vLLM."""
     last_exc = None
-    pulled   = False
-
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return fn()
         except Exception as exc:
             last_exc = exc
-
             if attempt == MAX_RETRIES:
                 logger.error(f"[RETRY] {label} – all {MAX_RETRIES} attempts failed. Last error: {exc}")
                 break
-
-            # Pull the model on the very first failure, once
-            if model and not pulled:
-                logger.warning(f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} failed: {exc}")
-                logger.info(f"[RETRY] First failure — pulling model before next attempt...")
-                pulled = pull_model(model, logger)
-                if not pulled:
-                    logger.error("[RETRY] Model pull failed; continuing retries anyway.")
-                # No sleep — pull itself takes time
-            else:
-                logger.warning(
-                    f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} failed: {exc}. "
-                    f"Retrying in {RETRY_DELAY}s..."
-                )
-                time.sleep(RETRY_DELAY)
-
+            logger.warning(
+                f"[RETRY] {label} – attempt {attempt}/{MAX_RETRIES} failed: {exc}. "
+                f"Retrying in {RETRY_DELAY}s..."
+            )
+            time.sleep(RETRY_DELAY)
     raise last_exc
 
 
@@ -173,8 +206,9 @@ def save_checkpoint(enriched, next_index, logger):
     tmp = CHECKPOINT + ".tmp"
     try:
         Path(tmp).write_text(
-            json.dumps({"next_index": next_index, "enriched": enriched}, indent=2, ensure_ascii=False),
-            encoding="utf-8"
+            json.dumps({"next_index": next_index, "enriched": enriched},
+                       indent=2, ensure_ascii=False),
+            encoding="utf-8",
         )
         Path(tmp).replace(Path(CHECKPOINT))
     except Exception as e:
@@ -182,13 +216,23 @@ def save_checkpoint(enriched, next_index, logger):
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  HELPER – strip optional markdown fences from JSON replies
+# ══════════════════════════════════════════════════════════════════════
+
+def _strip_fences(text: str) -> str:
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0]
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0]
+    return text.strip()
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  LLM CALL 1 – Humanise the 'value' (series label)
 # ══════════════════════════════════════════════════════════════════════
 
 def fetch_human_label(series_id: str, logger) -> str:
-    prompt = f"""You are an expert in economic and social indicators.
-
-Convert the following indicator code into a short, human-readable label (max 8 words).
+    user_prompt = f"""Convert the following indicator code into a short, human-readable label (max 8 words).
 Return ONLY a JSON object with a single key "label". No markdown, no extra text.
 
 Indicator code: {series_id}
@@ -200,23 +244,11 @@ Example:
 JSON response:"""
 
     def _call():
-        resp = requests.post(
-            f"{LLM_API_URL}/api/generate",
-            headers={"Content-Type": "application/json"},
-            json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        raw = resp.json().get("response", "").strip()
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0]
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0]
-        return json.loads(raw.strip()).get("label", series_id)
+        raw = call_vllm(user_prompt, temperature=0.2, max_tokens=2000000, logger=logger)
+        return json.loads(_strip_fences(raw)).get("label", series_id)
 
     try:
-        return with_retry(_call, label=f"human label for '{series_id}'",
-                          logger=logger, model=MODEL_NAME)
+        return with_retry(_call, label=f"human label for '{series_id}'", logger=logger)
     except Exception as exc:
         logger.error(f"[LABEL] Failed for '{series_id}': {exc}. Keeping original.")
         return series_id
@@ -230,9 +262,7 @@ def fetch_domain_and_context(row: dict, logger) -> dict:
     series = row.get("series", "N/A")
     value  = row.get("value", series)
 
-    prompt = f"""You are a data analyst specialising in global economic and social indicators.
-
-Given the indicator name and its statistical summary, return:
+    user_prompt = f"""Given the indicator name and its statistical summary, return:
   1. "domain"  – the single ISIC Rev.4 letter (A–U) that best fits the indicator.
   2. "context" – format: "<2-3 word sub-domain> - <2–3 sentence plain-English description of what it measures and how it is used>"
 
@@ -255,19 +285,8 @@ Std        : {row.get("Std")}
 JSON response:"""
 
     def _call():
-        resp = requests.post(
-            f"{LLM_API_URL}/api/generate",
-            headers={"Content-Type": "application/json"},
-            json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
-            timeout=300,
-        )
-        resp.raise_for_status()
-        raw = resp.json().get("response", "").strip()
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0]
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0]
-        result  = json.loads(raw.strip())
+        raw     = call_vllm(user_prompt, temperature=0.3, max_tokens=2000000, logger=logger)
+        result  = json.loads(_strip_fences(raw))
         domain  = result.get("domain", "S").strip().upper()
         context = result.get("context", "").strip()
         if domain not in ISIC_SECTIONS:
@@ -276,8 +295,11 @@ JSON response:"""
         return {"domain": domain, "context": context}
 
     try:
-        return with_retry(_call, label=f"domain/context for '{series}' economy={row.get('economy')}",
-                          logger=logger, model=MODEL_NAME)
+        return with_retry(
+            _call,
+            label=f"domain/context for '{series}' economy={row.get('economy')}",
+            logger=logger,
+        )
     except Exception as exc:
         logger.error(f"[ENRICH] All retries exhausted: {exc}. Using fallback.")
         return {"domain": "S", "context": ""}
@@ -362,7 +384,9 @@ def run(input_file: str, start_index: int, logger):
 # ══════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Enrich metrics JSON with domain, context, and human labels via LLM.")
+    parser = argparse.ArgumentParser(
+        description="Enrich metrics JSON with domain, context, and human labels via vLLM."
+    )
     parser.add_argument("--input",       default=INPUT_FILE,  help="Path to input metrics JSON")
     parser.add_argument("--output",      default=OUTPUT_FILE, help="Path to output enriched JSON")
     parser.add_argument("--start-index", type=int, default=0, help="Resume from this row index")
