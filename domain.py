@@ -11,7 +11,7 @@ import requests
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════
 
-LLM_API_URL = "http://vllm-gpt-oss.mobiusdtaas.ai/v1/chat/completions"
+LLM_API_URL = "http://vllm-gpt-oss-1.default.svc.cluster.local:8000/v1/chat/completions"
 MODEL_NAME  = "openai/gpt-oss-20b"
 
 INPUT_FILE  = "metrics.json"
